@@ -35,7 +35,6 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
   const socket = useRef<Socket | null>(null);
   const mySocketId = useRef<string | null>(null);
   const onSceneActionRef = useRef(onSceneAction);
-  const hasSentModelRef = useRef<boolean>(false);
 
   // Keep ref in sync without causing re-renders
   useEffect(() => {
@@ -103,7 +102,7 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
 
     // Handle incoming model notification
     socket.current.on("scene:model-incoming", (data: { metadata: any; size: number }) => {
-      console.log("📥 Model incoming:", data.metadata, "My ID:", mySocketId.current);
+      console.log("📥 Model incoming:", data.metadata);
       setDownloadProgress({
         uploading: true,
         progress: 0,
@@ -117,11 +116,10 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
         hasModel: !!sceneState.model,
         modelSize: sceneState.model?.length,
         hasTransform: !!sceneState.transform,
-        myId: mySocketId.current,
       });
 
       if (sceneState.model) {
-        console.log("🎨 Loading model from scene:init (joining existing room)");
+        console.log("🎨 Loading model from scene:init");
         onSceneActionRef.current({ type: "loadModel", payload: sceneState.model });
         
         setDownloadProgress({
@@ -136,7 +134,6 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
         // Apply transform after model loads
         if (sceneState.transform) {
           setTimeout(() => {
-            console.log("🔄 Applying initial transform from scene:init");
             onSceneActionRef.current({ type: "transform", payload: sceneState.transform });
           }, 100);
         }
@@ -144,21 +141,16 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
     });
 
     socket.current.on("scene:update", (data: { action: any; from: string }) => {
-      console.log("🔄 Received scene:update:", {
-        type: data.action.type,
-        from: data.from,
-        myId: mySocketId.current,
-        isSelf: data.from === mySocketId.current,
-      });
+      console.log("🔄 Received scene:update:", data.action.type, "from:", data.from);
       
-      // CRITICAL: Don't process our own actions to prevent feedback loops
+      // IMPORTANT: Don't process our own actions
       if (data.from === mySocketId.current) {
-        console.log("⏭️ Ignoring own action (sender is self)");
+        console.log("⏭️ Ignoring own action");
         return;
       }
       
       if (data.action.type === "loadModel") {
-        console.log("🎨 Loading model from scene:update (received from peer)");
+        console.log("🎨 Loading model from scene:update");
         setDownloadProgress({
           uploading: false,
           progress: 100,
@@ -166,8 +158,13 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
         });
       }
       
-      // Apply the action from the remote user
       onSceneActionRef.current(data.action);
+    });
+
+    // Handle gesture actions from remote users
+    socket.current.on("gesture:action", (data: { gesture: string; from: string }) => {
+      console.log("👋 Received gesture from:", data.from, "gesture:", data.gesture);
+      // You can add UI feedback here if needed
     });
 
     // WebRTC signaling
@@ -244,9 +241,8 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
       Object.values(peerConnections.current).forEach((pc) => pc.close());
       peerConnections.current = {};
       socket.current = null;
-      hasSentModelRef.current = false;
     };
-  }, [roomId, localStream]);
+  }, [roomId, localStream]); // REMOVED onSceneAction from deps
 
   const createPeerConnection = (remoteUserId: string) => {
     console.log("🔧 Creating peer connection for:", remoteUserId);
@@ -313,7 +309,7 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
         return;
       }
 
-      console.log("📤 Sending scene action:", action.type, "My ID:", mySocketId.current);
+      console.log("📤 Sending scene action:", action.type);
 
       // Show upload progress for model uploads
       if (action.type === "loadModel") {
@@ -322,7 +318,6 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
           progress: 50,
           fileName: fileName || "model",
         });
-        hasSentModelRef.current = true;
       }
 
       // Add metadata for model uploads
@@ -377,6 +372,15 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
     });
   };
 
+  const sendGesture = (gesture: string) => {
+    if (!socket.current?.connected) {
+      console.error("❌ Socket not connected");
+      return;
+    }
+    console.log("👋 Sending gesture:", gesture);
+    socket.current.emit("gesture:action", { gesture });
+  };
+
   const disconnect = () => {
     console.log("🔌 Disconnecting...");
     socket.current?.disconnect();
@@ -385,7 +389,6 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
     peerConnections.current = {};
     setRemoteStreams({});
     setIsConnected(false);
-    hasSentModelRef.current = false;
   };
 
   return {
@@ -395,6 +398,7 @@ export const useWebRTC = ({ roomId, onSceneAction }: UseWebRTCProps) => {
     uploadProgress,
     downloadProgress,
     sendSceneAction,
+    sendGesture,
     disconnect,
   };
 };

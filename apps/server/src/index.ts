@@ -74,8 +74,8 @@ io.on("connection", (socket: Socket) => {
     console.log(`Notified room ${roomId} about new user ${socket.id}`);
 
     // Handle scene actions
-    socket.on("scene:action", (action, callback) => {
-      console.log(`Scene action from ${socket.id}:`, action.type);
+     socket.on("scene:action", (action, callback) => {
+      console.log(`🎬 Scene action from ${socket.id}:`, action.type);
 
       try {
         // Update the server-side scene state
@@ -95,7 +95,7 @@ io.on("connection", (socket: Socket) => {
             };
 
             console.log(
-              `Model loaded in room ${roomId}:`,
+              `📦 Model loaded in room ${roomId}:`,
               `Name: ${metadata.name},`,
               `Size: ${(metadata.size / 1024 / 1024).toFixed(2)}MB`
             );
@@ -106,13 +106,12 @@ io.on("connection", (socket: Socket) => {
               size: modelData.length,
             });
 
-            // IMPORTANT: Broadcast with sender ID
+            // Broadcast with sender ID
             socket.to(roomId).emit("scene:update", {
               action,
-              from: socket.id, // Include sender's ID
+              from: socket.id,
             });
 
-            // Send acknowledgment
             if (callback) callback({ success: true });
             break;
 
@@ -120,7 +119,7 @@ io.on("connection", (socket: Socket) => {
             if (roomScenes[roomId]) {
               roomScenes[roomId].transform = action.payload;
             }
-            // IMPORTANT: Broadcast with sender ID
+            // Broadcast with sender ID
             socket.to(roomId).emit("scene:update", {
               action,
               from: socket.id,
@@ -130,8 +129,8 @@ io.on("connection", (socket: Socket) => {
 
           case "clear":
             roomScenes[roomId] = { model: null, modelMetadata: null, transform: null };
-            console.log(`Scene cleared in room ${roomId}`);
-            // IMPORTANT: Broadcast with sender ID
+            console.log(`🧹 Scene cleared in room ${roomId}`);
+            // Broadcast with sender ID
             socket.to(roomId).emit("scene:update", {
               action,
               from: socket.id,
@@ -143,9 +142,19 @@ io.on("connection", (socket: Socket) => {
             if (callback) callback({ success: false, error: "Unknown action" });
         }
       } catch (error) {
-        console.error(`Error processing scene action:`, error);
+        console.error(`❌ Error processing scene action:`, error);
         if (callback) callback({ success: false, error: String(error) });
       }
+    });
+
+    // Handle gesture actions
+    socket.on("gesture:action", (data: { gesture: string }) => {
+      console.log(`👋 Gesture from ${socket.id}:`, data.gesture);
+      // Broadcast gesture to other users in the room
+      socket.to(roomId).emit("gesture:action", {
+        gesture: data.gesture,
+        from: socket.id,
+      });
     });
 
     // Handle model chunk upload (for very large files)

@@ -22,6 +22,7 @@ export interface SceneHandle {
   loadModel: (fileDataUrl: string) => void;
   clear: () => void;
   applyTransform: (transform: any) => void;
+  getTransform: () => any | null;
   resetCamera: () => void;
 }
 
@@ -37,6 +38,7 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
     const animationFrameIdRef = useRef<number | null>(null);
     const isLoadingRef = useRef<boolean>(false);
 
+    // handle window resizing
     const handleResize = useCallback(() => {
       if (cameraRef.current && rendererRef.current && mountRef.current) {
         const { clientWidth, clientHeight } = mountRef.current;
@@ -48,12 +50,18 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
 
     const removeModel = () => {
       if (modelRef.current) {
+        console.log("Removing existing model");
+
+        // detach from transform controls and hide them
         if (transformControlsRef.current) {
           transformControlsRef.current.detach();
+          transformControlsRef.current.enabled = false;
         }
+
+        // remove from scene
         sceneRef.current.remove(modelRef.current);
 
-        // Dispose of model resources
+        // remove of model's geometries and materials to free up resources
         modelRef.current.traverse((child) => {
           if (child instanceof THREE.Mesh) {
             child.geometry?.dispose();
@@ -71,6 +79,7 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
 
     const applyTransformToModel = (transform: any) => {
       if (modelRef.current && transform) {
+        console.log("Applying transform to model");
         modelRef.current.position.fromArray(transform.position);
         modelRef.current.rotation.set(
           transform.rotation[0],
@@ -82,6 +91,21 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       }
     };
 
+    const getModelTransform = () => {
+      if (!modelRef.current) return null;
+
+      return {
+        position: modelRef.current.position.toArray(),
+        rotation: [
+          modelRef.current.rotation.x,
+          modelRef.current.rotation.y,
+          modelRef.current.rotation.z,
+          modelRef.current.rotation.order,
+        ],
+        scale: modelRef.current.scale.toArray(),
+      };
+    };
+
     const loadModelFromDataUrl = (dataUrl: string) => {
       // Prevent multiple simultaneous loads
       if (isLoadingRef.current) {
@@ -89,6 +113,7 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
         return;
       }
 
+      console.log("🎨 Starting model load process");
       isLoadingRef.current = true;
       removeModel();
 
@@ -109,16 +134,28 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       const { loader } = getLoaderAndExtension(dataUrl);
 
       const onLoadComplete = (object: THREE.Group | THREE.Object3D) => {
-        console.log("✅ Model loaded successfully");
+        console.log("✅ Model loaded successfully, adding to scene");
         const group =
           object instanceof THREE.Group
             ? object
             : new THREE.Group().add(object);
-        modelRef.current = group;
-        sceneRef.current.add(group);
 
+        // Store reference first
+        modelRef.current = group;
+
+        // Add to scene
+        sceneRef.current.add(group);
+        console.log("✅ Model added to scene");
+
+        // Attach transform controls
         if (transformControlsRef.current) {
-          transformControlsRef.current.attach(group);
+          try {
+            transformControlsRef.current.attach(group);
+            transformControlsRef.current.enabled = true;
+            console.log("✅ Transform controls attached to model");
+          } catch (error) {
+            console.error("❌ Error attaching transform controls:", error);
+          }
         }
 
         isLoadingRef.current = false;
@@ -164,6 +201,7 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       loadModel: loadModelFromDataUrl,
       clear: removeModel,
       applyTransform: applyTransformToModel,
+      getTransform: getModelTransform,
       resetCamera: handleResize,
     }));
 
@@ -210,10 +248,20 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       controls.dampingFactor = 0.05;
       controlsRef.current = controls;
 
+      // Create transform controls
       const transformControls = new TransformControls(
         camera,
         renderer.domElement
       );
+
+      // Set initial mode to translate
+      transformControls.setMode("translate");
+
+      // CRITICAL: Disable transform controls initially - prevents rendering artifacts
+      transformControls.enabled = false;
+
+      // Set size to make gizmos less intrusive
+      transformControls.setSize(0.8);
 
       transformControls.addEventListener("dragging-changed", (event) => {
         if (controlsRef.current) {
@@ -237,9 +285,12 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
         }
       });
 
-      // FIX: Don't add TransformControls to scene, it's a helper control
-      // Just keep a reference to it - it works without being in the scene
+      // Add transform controls to scene
+      scene.add(transformControls);
       transformControlsRef.current = transformControls;
+      console.log(
+        "✅ Transform controls added to scene (disabled until model loads)"
+      );
 
       // Add keyboard controls for transform mode
       const handleKeyDown = (event: KeyboardEvent) => {

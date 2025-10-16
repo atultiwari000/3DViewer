@@ -16,18 +16,23 @@ import { TransformControls } from "three/addons/controls/TransformControls.js";
 
 interface SceneProps {
   onTransformChange?: (transform: any) => void;
+  onCameraChange?: (camera: any) => void;
 }
 
 export interface SceneHandle {
-  loadModel: (fileDataUrl: string) => void;
+  loadModel: (
+    fileDataUrl: string,
+    onLoad?: (initialTransform: any) => void
+  ) => void;
   clear: () => void;
   applyTransform: (transform: any) => void;
   getTransform: () => any | null;
+  applyCameraTransform: (camera: any) => void;
   resetCamera: () => void;
 }
 
 const Scene = forwardRef<SceneHandle, SceneProps>(
-  ({ onTransformChange }, ref) => {
+  ({ onTransformChange, onCameraChange }, ref) => {
     const mountRef = useRef<HTMLDivElement>(null);
     const sceneRef = useRef(new THREE.Scene());
     const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -37,8 +42,8 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
     const modelRef = useRef<THREE.Group | null>(null);
     const animationFrameIdRef = useRef<number | null>(null);
     const isLoadingRef = useRef<boolean>(false);
+    const isSyncingCameraRef = useRef<boolean>(false);
 
-    // handle window resizing
     const handleResize = useCallback(() => {
       if (cameraRef.current && rendererRef.current && mountRef.current) {
         const { clientWidth, clientHeight } = mountRef.current;
@@ -48,20 +53,16 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       }
     }, []);
 
-    const removeModel = () => {
+    const removeModel = useCallback(() => {
       if (modelRef.current) {
-        console.log("Removing existing model");
+        console.log("🧹 Removing existing model");
 
-        // detach from transform controls and hide them
         if (transformControlsRef.current) {
           transformControlsRef.current.detach();
-          transformControlsRef.current.enabled = false;
         }
 
-        // remove from scene
         sceneRef.current.remove(modelRef.current);
 
-        // remove of model's geometries and materials to free up resources
         modelRef.current.traverse((child) => {
           if (child instanceof THREE.Mesh) {
             child.geometry?.dispose();
@@ -75,23 +76,24 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
 
         modelRef.current = null;
       }
-    };
+    }, []);
 
-    const applyTransformToModel = (transform: any) => {
+    const applyTransformToModel = useCallback((transform: any) => {
       if (modelRef.current && transform) {
-        console.log("Applying transform to model");
         modelRef.current.position.fromArray(transform.position);
         modelRef.current.rotation.set(
           transform.rotation[0],
           transform.rotation[1],
           transform.rotation[2],
-          transform.rotation[3]
+          transform.rotation[3] || "XYZ"
         );
         modelRef.current.scale.fromArray(transform.scale);
+        modelRef.current.updateMatrix();
+        modelRef.current.updateMatrixWorld(true);
       }
-    };
+    }, []);
 
-    const getModelTransform = () => {
+    const getModelTransform = useCallback(() => {
       if (!modelRef.current) return null;
 
       return {
@@ -104,104 +106,128 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
         ],
         scale: modelRef.current.scale.toArray(),
       };
-    };
+    }, []);
 
-    const loadModelFromDataUrl = (dataUrl: string) => {
-      // Prevent multiple simultaneous loads
-      if (isLoadingRef.current) {
-        console.log("⏳ Model already loading, skipping duplicate request");
-        return;
-      }
-
-      console.log("🎨 Starting model load process");
-      isLoadingRef.current = true;
-      removeModel();
-
-      const getLoaderAndExtension = (url: string) => {
-        if (url.includes("data:model/gltf-binary") || url.includes(".glb")) {
-          return { loader: new GLTFLoader(), ext: "glb" };
-        } else if (url.includes(".gltf")) {
-          return { loader: new GLTFLoader(), ext: "gltf" };
-        } else if (url.includes(".obj")) {
-          return { loader: new OBJLoader(), ext: "obj" };
-        } else if (url.includes(".fbx")) {
-          return { loader: new FBXLoader(), ext: "fbx" };
+    const loadModelFromDataUrl = useCallback(
+      (dataUrl: string, onLoad?: (initialTransform: any) => void) => {
+        if (isLoadingRef.current) {
+          console.log("⏳ Model already loading, skipping duplicate request");
+          return;
         }
-        // Default to GLTF
-        return { loader: new GLTFLoader(), ext: "glb" };
-      };
 
-      const { loader } = getLoaderAndExtension(dataUrl);
+        console.log("🎨 Starting model load process");
+        isLoadingRef.current = true;
+        removeModel();
 
-      const onLoadComplete = (object: THREE.Group | THREE.Object3D) => {
-        console.log("✅ Model loaded successfully, adding to scene");
-        const group =
-          object instanceof THREE.Group
-            ? object
-            : new THREE.Group().add(object);
-
-        // Store reference first
-        modelRef.current = group;
-
-        // Add to scene
-        sceneRef.current.add(group);
-        console.log("✅ Model added to scene");
-
-        // Attach transform controls
-        if (transformControlsRef.current) {
-          try {
-            transformControlsRef.current.attach(group);
-            transformControlsRef.current.enabled = true;
-            console.log("✅ Transform controls attached to model");
-          } catch (error) {
-            console.error("❌ Error attaching transform controls:", error);
+        const getLoaderAndExtension = (
+          url: string
+        ): { loader: GLTFLoader | OBJLoader | FBXLoader; ext: string } => {
+          if (url.includes("data:model/gltf-binary") || url.endsWith(".glb")) {
+            return { loader: new GLTFLoader(), ext: "glb" };
+          } else if (url.endsWith(".gltf")) {
+            return { loader: new GLTFLoader(), ext: "gltf" };
+          } else if (url.endsWith(".obj")) {
+            return { loader: new OBJLoader(), ext: "obj" };
+          } else if (url.endsWith(".fbx")) {
+            return { loader: new FBXLoader(), ext: "fbx" };
           }
+          return { loader: new GLTFLoader(), ext: "glb" }; // Default fallback
+        };
+
+        const { loader, ext } = getLoaderAndExtension(dataUrl);
+
+        const onLoadComplete = (object: THREE.Group | THREE.Object3D) => {
+          console.log("✅ Model loaded successfully");
+          const group =
+            object instanceof THREE.Group
+              ? object
+              : new THREE.Group().add(object);
+
+          modelRef.current = group;
+          sceneRef.current.add(group);
+
+          if (transformControlsRef.current) {
+            transformControlsRef.current.attach(group);
+          }
+
+          isLoadingRef.current = false;
+
+          const initialTransform = getModelTransform();
+          if (initialTransform && onLoad) {
+            console.log("🚀 Firing onLoad callback with initial transform");
+            onLoad(initialTransform);
+          }
+        };
+
+        const onLoadError = (error: any) => {
+          console.error("❌ Error loading model:", error);
+          isLoadingRef.current = false;
+        };
+
+        // --- CHANGE START ---
+        // Reverted to the type-safe, loader-specific loading logic while keeping the onLoad callback.
+        // This fixes the 'instanceof' TypeScript error.
+        if (ext === "gltf" || ext === "glb") {
+          fetch(dataUrl)
+            .then((res) => res.arrayBuffer())
+            .then((buffer) => {
+              (loader as GLTFLoader).parse(
+                buffer,
+                "",
+                (gltf) => onLoadComplete(gltf.scene),
+                onLoadError
+              );
+            })
+            .catch(onLoadError);
+        } else if (ext === "obj") {
+          fetch(dataUrl)
+            .then((res) => res.text())
+            .then((text) => {
+              const object = (loader as OBJLoader).parse(text);
+              onLoadComplete(object);
+            })
+            .catch(onLoadError);
+        } else if (ext === "fbx") {
+          fetch(dataUrl)
+            .then((res) => res.arrayBuffer())
+            .then((buffer) => {
+              const object = (loader as FBXLoader).parse(buffer, "");
+              onLoadComplete(object);
+            })
+            .catch(onLoadError);
         }
+        // --- CHANGE END ---
+      },
+      [removeModel, getModelTransform]
+    );
 
-        isLoadingRef.current = false;
-      };
+    const applyCameraTransform = useCallback((cameraData: any) => {
+      if (
+        cameraRef.current &&
+        controlsRef.current &&
+        cameraData &&
+        !isSyncingCameraRef.current
+      ) {
+        console.log("📷 Applying camera transform from remote");
+        isSyncingCameraRef.current = true;
 
-      const onLoadError = (error: any) => {
-        console.error("❌ Error loading model:", error);
-        isLoadingRef.current = false;
-      };
+        cameraRef.current.position.fromArray(cameraData.position);
+        controlsRef.current.target.fromArray(cameraData.target);
+        cameraRef.current.updateProjectionMatrix();
+        controlsRef.current.update();
 
-      if (loader instanceof GLTFLoader) {
-        fetch(dataUrl)
-          .then((res) => res.arrayBuffer())
-          .then((buffer) => {
-            loader.parse(
-              buffer,
-              "",
-              (gltf) => onLoadComplete(gltf.scene),
-              onLoadError
-            );
-          })
-          .catch(onLoadError);
-      } else if (loader instanceof OBJLoader) {
-        fetch(dataUrl)
-          .then((res) => res.text())
-          .then((text) => {
-            const object = loader.parse(text);
-            onLoadComplete(object);
-          })
-          .catch(onLoadError);
-      } else if (loader instanceof FBXLoader) {
-        fetch(dataUrl)
-          .then((res) => res.arrayBuffer())
-          .then((buffer) => {
-            const object = loader.parse(buffer, "");
-            onLoadComplete(object);
-          })
-          .catch(onLoadError);
+        setTimeout(() => {
+          isSyncingCameraRef.current = false;
+        }, 100);
       }
-    };
+    }, []);
 
     useImperativeHandle(ref, () => ({
       loadModel: loadModelFromDataUrl,
       clear: removeModel,
       applyTransform: applyTransformToModel,
       getTransform: getModelTransform,
+      applyCameraTransform: applyCameraTransform,
       resetCamera: handleResize,
     }));
 
@@ -210,20 +236,16 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       const currentMount = mountRef.current;
 
       const scene = sceneRef.current;
-      scene.background = new THREE.Color(0xeeeeee);
+      scene.background = new THREE.Color(0x111111);
 
-      const gridHelper = new THREE.GridHelper(10, 10);
+      const gridHelper = new THREE.GridHelper(15, 15, 0x888888, 0x444444);
       scene.add(gridHelper);
 
-      const axesHelper = new THREE.AxesHelper(5);
-      scene.add(axesHelper);
-
-      // Add lighting
-      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
       scene.add(ambientLight);
 
-      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-      directionalLight.position.set(5, 10, 5);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+      directionalLight.position.set(5, 10, 7.5);
       scene.add(directionalLight);
 
       const { clientWidth, clientHeight } = currentMount;
@@ -233,8 +255,7 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
         0.1,
         1000
       );
-      camera.position.set(5, 5, 5);
-      camera.lookAt(0, 0, 0);
+      camera.position.set(7, 7, 7);
       cameraRef.current = camera;
 
       const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -245,24 +266,25 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
 
       const controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
-      controls.dampingFactor = 0.05;
       controlsRef.current = controls;
 
-      // Create transform controls
+      let cameraChangeTimeout: NodeJS.Timeout;
+      controls.addEventListener("change", () => {
+        if (onCameraChange && !isSyncingCameraRef.current) {
+          clearTimeout(cameraChangeTimeout);
+          cameraChangeTimeout = setTimeout(() => {
+            onCameraChange({
+              position: camera.position.toArray(),
+              target: controls.target.toArray(),
+            });
+          }, 100);
+        }
+      });
+
       const transformControls = new TransformControls(
         camera,
         renderer.domElement
       );
-
-      // Set initial mode to translate
-      transformControls.setMode("translate");
-
-      // CRITICAL: Disable transform controls initially - prevents rendering artifacts
-      transformControls.enabled = false;
-
-      // Set size to make gizmos less intrusive
-      transformControls.setSize(0.8);
-
       transformControls.addEventListener("dragging-changed", (event) => {
         if (controlsRef.current) {
           controlsRef.current.enabled = !event.value;
@@ -270,32 +292,18 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       });
 
       transformControls.addEventListener("objectChange", () => {
-        if (modelRef.current && onTransformChange) {
-          const transform = {
-            position: modelRef.current.position.toArray(),
-            rotation: [
-              modelRef.current.rotation.x,
-              modelRef.current.rotation.y,
-              modelRef.current.rotation.z,
-              modelRef.current.rotation.order,
-            ],
-            scale: modelRef.current.scale.toArray(),
-          };
-          onTransformChange(transform);
+        if (onTransformChange) {
+          const transform = getModelTransform();
+          if (transform) {
+            onTransformChange(transform);
+          }
         }
       });
-
-      // Add transform controls to scene
-      scene.add(transformControls);
+      scene.add(transformControls.getHelper());
       transformControlsRef.current = transformControls;
-      console.log(
-        "✅ Transform controls added to scene (disabled until model loads)"
-      );
 
-      // Add keyboard controls for transform mode
       const handleKeyDown = (event: KeyboardEvent) => {
         if (!transformControlsRef.current) return;
-
         switch (event.key.toLowerCase()) {
           case "w":
             transformControlsRef.current.setMode("translate");
@@ -308,7 +316,6 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
             break;
         }
       };
-
       window.addEventListener("keydown", handleKeyDown);
 
       const animate = () => {
@@ -326,32 +333,21 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
         }
         window.removeEventListener("resize", handleResize);
         window.removeEventListener("keydown", handleKeyDown);
-
         controls.dispose();
         transformControls.dispose();
         removeModel();
-
-        scene.children.forEach((child) => {
-          if (child instanceof THREE.Mesh) {
-            child.geometry?.dispose();
-            if (Array.isArray(child.material)) {
-              child.material.forEach((mat) => mat.dispose());
-            } else {
-              child.material?.dispose();
-            }
-          }
-        });
-
-        if (rendererRef.current) {
-          rendererRef.current.dispose();
-          if (currentMount && rendererRef.current.domElement) {
-            if (currentMount.contains(rendererRef.current.domElement)) {
-              currentMount.removeChild(rendererRef.current.domElement);
-            }
-          }
+        if (rendererRef.current?.domElement) {
+          currentMount.removeChild(rendererRef.current.domElement);
         }
+        rendererRef.current?.dispose();
       };
-    }, [handleResize, onTransformChange]);
+    }, [
+      handleResize,
+      onTransformChange,
+      onCameraChange,
+      removeModel,
+      getModelTransform,
+    ]);
 
     return <div ref={mountRef} style={{ width: "100%", height: "100%" }} />;
   }

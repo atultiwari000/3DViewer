@@ -13,22 +13,21 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { EulerOrder, Transform, CameraTransform } from "@/hooks/useWebRTC";
 
 interface SceneProps {
-  onTransformChange?: (transform: any) => void;
-  onCameraChange?: (camera: any) => void;
+  onTransformChange: (transform: Transform) => void;
+  onCameraChange: (camera: CameraTransform) => void;
 }
 
 export interface SceneHandle {
   loadModel: (
     fileDataUrl: string,
-    onLoad?: (initialTransform: any) => void
+    onComplete?: (transform: Transform) => void
   ) => void;
   clear: () => void;
-  applyTransform: (transform: any) => void;
-  getTransform: () => any | null;
-  applyCameraTransform: (camera: any) => void;
-  resetCamera: () => void;
+  applyTransform: (transform: Transform) => void;
+  applyCameraTransform: (camera: CameraTransform) => void;
 }
 
 const Scene = forwardRef<SceneHandle, SceneProps>(
@@ -39,284 +38,141 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
     const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
     const controlsRef = useRef<OrbitControls | null>(null);
     const transformControlsRef = useRef<TransformControls | null>(null);
-    const modelRef = useRef<THREE.Group | null>(null);
+    const modelRef = useRef<THREE.Object3D | null>(null);
     const animationFrameIdRef = useRef<number | null>(null);
-    const isLoadingRef = useRef<boolean>(false);
-    const isSyncingCameraRef = useRef<boolean>(false);
 
-    const handleResize = useCallback(() => {
-      if (cameraRef.current && rendererRef.current && mountRef.current) {
-        const { clientWidth, clientHeight } = mountRef.current;
-        cameraRef.current.aspect = clientWidth / clientHeight;
-        cameraRef.current.updateProjectionMatrix();
-        rendererRef.current.setSize(clientWidth, clientHeight);
-      }
-    }, []);
+    // feedback loop prevention
+    const isApplyingUpdateRef = useRef(false);
 
-    const removeModel = useCallback(() => {
-      if (modelRef.current) {
-        console.log("🧹 Removing existing model");
+    useImperativeHandle(ref, () => ({
+      loadModel: (dataUrl, onComplete) => {
+        removeModel();
+        const { loader, ext } = getLoaderAndExt(dataUrl);
 
-        if (transformControlsRef.current) {
-          transformControlsRef.current.detach();
-        }
+        const onLoad = (object: THREE.Object3D) => {
+          modelRef.current = object;
+          sceneRef.current.add(object);
+          transformControlsRef.current?.attach(object);
 
-        sceneRef.current.remove(modelRef.current);
-
-        modelRef.current.traverse((child) => {
-          if (child instanceof THREE.Mesh) {
-            child.geometry?.dispose();
-            if (Array.isArray(child.material)) {
-              child.material.forEach((mat) => mat.dispose());
-            } else {
-              child.material?.dispose();
-            }
+          if (onComplete) {
+            const { position, rotation, scale } = object;
+            onComplete({
+              position: position.toArray(),
+              rotation: [
+                rotation.x,
+                rotation.y,
+                rotation.z,
+                rotation.order as EulerOrder,
+              ],
+              scale: scale.toArray(),
+            });
           }
-        });
+        };
 
-        modelRef.current = null;
-      }
-    }, []);
+        const onError = (error: any) =>
+          console.error(`Error loading .${ext} model:`, error);
 
-    const applyTransformToModel = useCallback((transform: any) => {
-      if (modelRef.current && transform) {
+        fetch(dataUrl)
+          .then((res) => res.arrayBuffer())
+          .then((buffer) => {
+            if (ext === "gltf" || ext === "glb") {
+              (loader as GLTFLoader).parse(
+                buffer,
+                "",
+                (gltf) => onLoad(gltf.scene),
+                onError
+              );
+            } else if (ext === "fbx") {
+              const scene = (loader as FBXLoader).parse(buffer, "");
+              onLoad(scene);
+            } else {
+              // For obj, we need to read as text
+              return new Response(buffer).text().then((text) => {
+                const object = (loader as OBJLoader).parse(text);
+                onLoad(object);
+              });
+            }
+          })
+          .catch(onError);
+      },
+      clear: removeModel,
+      applyTransform: (transform) => {
+        if (!modelRef.current) return;
+        isApplyingUpdateRef.current = true;
         modelRef.current.position.fromArray(transform.position);
         modelRef.current.rotation.set(
           transform.rotation[0],
           transform.rotation[1],
           transform.rotation[2],
-          transform.rotation[3] || "XYZ"
+          transform.rotation[3]
         );
         modelRef.current.scale.fromArray(transform.scale);
-        modelRef.current.updateMatrix();
-        modelRef.current.updateMatrixWorld(true);
-      }
-    }, []);
-
-    const getModelTransform = useCallback(() => {
-      if (!modelRef.current) return null;
-
-      return {
-        position: modelRef.current.position.toArray(),
-        rotation: [
-          modelRef.current.rotation.x,
-          modelRef.current.rotation.y,
-          modelRef.current.rotation.z,
-          modelRef.current.rotation.order,
-        ],
-        scale: modelRef.current.scale.toArray(),
-      };
-    }, []);
-
-    const loadModelFromDataUrl = useCallback(
-      (dataUrl: string, onLoad?: (initialTransform: any) => void) => {
-        if (isLoadingRef.current) {
-          console.log("⏳ Model already loading, skipping duplicate request");
-          return;
-        }
-
-        console.log("🎨 Starting model load process");
-        isLoadingRef.current = true;
-        removeModel();
-
-        const getLoaderAndExtension = (
-          url: string
-        ): { loader: GLTFLoader | OBJLoader | FBXLoader; ext: string } => {
-          if (url.includes("data:model/gltf-binary") || url.endsWith(".glb")) {
-            return { loader: new GLTFLoader(), ext: "glb" };
-          } else if (url.endsWith(".gltf")) {
-            return { loader: new GLTFLoader(), ext: "gltf" };
-          } else if (url.endsWith(".obj")) {
-            return { loader: new OBJLoader(), ext: "obj" };
-          } else if (url.endsWith(".fbx")) {
-            return { loader: new FBXLoader(), ext: "fbx" };
-          }
-          return { loader: new GLTFLoader(), ext: "glb" }; // Default fallback
-        };
-
-        const { loader, ext } = getLoaderAndExtension(dataUrl);
-
-        const onLoadComplete = (object: THREE.Group | THREE.Object3D) => {
-          console.log("✅ Model loaded successfully");
-          const group =
-            object instanceof THREE.Group
-              ? object
-              : new THREE.Group().add(object);
-
-          modelRef.current = group;
-          sceneRef.current.add(group);
-
-          if (transformControlsRef.current) {
-            transformControlsRef.current.attach(group);
-          }
-
-          isLoadingRef.current = false;
-
-          const initialTransform = getModelTransform();
-          if (initialTransform && onLoad) {
-            console.log("🚀 Firing onLoad callback with initial transform");
-            onLoad(initialTransform);
-          }
-        };
-
-        const onLoadError = (error: any) => {
-          console.error("❌ Error loading model:", error);
-          isLoadingRef.current = false;
-        };
-
-        // --- CHANGE START ---
-        // Reverted to the type-safe, loader-specific loading logic while keeping the onLoad callback.
-        // This fixes the 'instanceof' TypeScript error.
-        if (ext === "gltf" || ext === "glb") {
-          fetch(dataUrl)
-            .then((res) => res.arrayBuffer())
-            .then((buffer) => {
-              (loader as GLTFLoader).parse(
-                buffer,
-                "",
-                (gltf) => onLoadComplete(gltf.scene),
-                onLoadError
-              );
-            })
-            .catch(onLoadError);
-        } else if (ext === "obj") {
-          fetch(dataUrl)
-            .then((res) => res.text())
-            .then((text) => {
-              const object = (loader as OBJLoader).parse(text);
-              onLoadComplete(object);
-            })
-            .catch(onLoadError);
-        } else if (ext === "fbx") {
-          fetch(dataUrl)
-            .then((res) => res.arrayBuffer())
-            .then((buffer) => {
-              const object = (loader as FBXLoader).parse(buffer, "");
-              onLoadComplete(object);
-            })
-            .catch(onLoadError);
-        }
-        // --- CHANGE END ---
+        isApplyingUpdateRef.current = false;
       },
-      [removeModel, getModelTransform]
-    );
-
-    const applyCameraTransform = useCallback((cameraData: any) => {
-      if (
-        cameraRef.current &&
-        controlsRef.current &&
-        cameraData &&
-        !isSyncingCameraRef.current
-      ) {
-        console.log("📷 Applying camera transform from remote");
-        isSyncingCameraRef.current = true;
-
-        cameraRef.current.position.fromArray(cameraData.position);
-        controlsRef.current.target.fromArray(cameraData.target);
-        cameraRef.current.updateProjectionMatrix();
-        controlsRef.current.update();
-
-        setTimeout(() => {
-          isSyncingCameraRef.current = false;
-        }, 100);
-      }
-    }, []);
-
-    useImperativeHandle(ref, () => ({
-      loadModel: loadModelFromDataUrl,
-      clear: removeModel,
-      applyTransform: applyTransformToModel,
-      getTransform: getModelTransform,
-      applyCameraTransform: applyCameraTransform,
-      resetCamera: handleResize,
+      applyCameraTransform: (camera) => {
+        if (!cameraRef.current || !controlsRef.current) return;
+        isApplyingUpdateRef.current = true;
+        cameraRef.current.position.fromArray(camera.position);
+        controlsRef.current.target.fromArray(camera.target);
+        controlsRef.current.update(); // update controls after setting camera
+        isApplyingUpdateRef.current = false;
+      },
     }));
 
+    const getLoaderAndExt = (url: string) => {
+      const lowerUrl = url.toLowerCase();
+      if (lowerUrl.endsWith(".glb") || lowerUrl.includes("model/gltf-binary"))
+        return { loader: new GLTFLoader(), ext: "glb" };
+      if (lowerUrl.endsWith(".gltf"))
+        return { loader: new GLTFLoader(), ext: "gltf" };
+      if (lowerUrl.endsWith(".obj"))
+        return { loader: new OBJLoader(), ext: "obj" };
+      if (lowerUrl.endsWith(".fbx"))
+        return { loader: new FBXLoader(), ext: "fbx" };
+      return { loader: new GLTFLoader(), ext: "glb" }; // Fallback
+    };
+
+    const removeModel = () => {
+      if (modelRef.current) {
+        transformControlsRef.current?.detach();
+        sceneRef.current.remove(modelRef.current);
+        modelRef.current = null;
+      }
+    };
+
+    // Scene setup (only runs once)
     useEffect(() => {
-      if (!mountRef.current) return;
-      const currentMount = mountRef.current;
+      const mount = mountRef.current!;
 
       const scene = sceneRef.current;
-      scene.background = new THREE.Color(0x111111);
+      scene.background = new THREE.Color(0x1a1a1a);
+      scene.add(new THREE.GridHelper(20, 20, 0x888888, 0x444444));
+      scene.add(new THREE.AmbientLight(0xffffff, 0.7));
 
-      const gridHelper = new THREE.GridHelper(15, 15, 0x888888, 0x444444);
-      scene.add(gridHelper);
-
-      const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
-      scene.add(ambientLight);
-
-      const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
-      directionalLight.position.set(5, 10, 7.5);
-      scene.add(directionalLight);
-
-      const { clientWidth, clientHeight } = currentMount;
       const camera = new THREE.PerspectiveCamera(
         75,
-        clientWidth / clientHeight,
+        mount.clientWidth / mount.clientHeight,
         0.1,
         1000
       );
-      camera.position.set(7, 7, 7);
+      camera.position.set(5, 5, 5);
       cameraRef.current = camera;
 
       const renderer = new THREE.WebGLRenderer({ antialias: true });
-      renderer.setSize(clientWidth, clientHeight);
+      renderer.setSize(mount.clientWidth, mount.clientHeight);
       renderer.setPixelRatio(window.devicePixelRatio);
       rendererRef.current = renderer;
-      currentMount.appendChild(renderer.domElement);
+      mount.appendChild(renderer.domElement);
 
       const controls = new OrbitControls(camera, renderer.domElement);
-      controls.enableDamping = true;
       controlsRef.current = controls;
-
-      let cameraChangeTimeout: NodeJS.Timeout;
-      controls.addEventListener("change", () => {
-        if (onCameraChange && !isSyncingCameraRef.current) {
-          clearTimeout(cameraChangeTimeout);
-          cameraChangeTimeout = setTimeout(() => {
-            onCameraChange({
-              position: camera.position.toArray(),
-              target: controls.target.toArray(),
-            });
-          }, 100);
-        }
-      });
 
       const transformControls = new TransformControls(
         camera,
         renderer.domElement
       );
-      transformControls.addEventListener("dragging-changed", (event) => {
-        if (controlsRef.current) {
-          controlsRef.current.enabled = !event.value;
-        }
-      });
-
-      transformControls.addEventListener("objectChange", () => {
-        if (onTransformChange) {
-          const transform = getModelTransform();
-          if (transform) {
-            onTransformChange(transform);
-          }
-        }
-      });
       scene.add(transformControls.getHelper());
       transformControlsRef.current = transformControls;
-
-      const handleKeyDown = (event: KeyboardEvent) => {
-        if (!transformControlsRef.current) return;
-        switch (event.key.toLowerCase()) {
-          case "w":
-            transformControlsRef.current.setMode("translate");
-            break;
-          case "e":
-            transformControlsRef.current.setMode("rotate");
-            break;
-          case "r":
-            transformControlsRef.current.setMode("scale");
-            break;
-        }
-      };
-      window.addEventListener("keydown", handleKeyDown);
 
       const animate = () => {
         animationFrameIdRef.current = requestAnimationFrame(animate);
@@ -325,29 +181,81 @@ const Scene = forwardRef<SceneHandle, SceneProps>(
       };
       animate();
 
+      const handleResize = () => {
+        camera.aspect = mount.clientWidth / mount.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(mount.clientWidth, mount.clientHeight);
+      };
       window.addEventListener("resize", handleResize);
 
       return () => {
-        if (animationFrameIdRef.current) {
-          cancelAnimationFrame(animationFrameIdRef.current);
-        }
         window.removeEventListener("resize", handleResize);
-        window.removeEventListener("keydown", handleKeyDown);
+        if (animationFrameIdRef.current)
+          cancelAnimationFrame(animationFrameIdRef.current);
+        mount.removeChild(renderer.domElement);
         controls.dispose();
         transformControls.dispose();
-        removeModel();
-        if (rendererRef.current?.domElement) {
-          currentMount.removeChild(rendererRef.current.domElement);
-        }
-        rendererRef.current?.dispose();
       };
-    }, [
-      handleResize,
-      onTransformChange,
-      onCameraChange,
-      removeModel,
-      getModelTransform,
-    ]);
+    }, []);
+
+    useEffect(() => {
+      const controls = controlsRef.current!;
+      const transformControls = transformControlsRef.current!;
+
+      let cameraTimeout: NodeJS.Timeout;
+      const handleCameraChange = () => {
+        if (isApplyingUpdateRef.current) return;
+        clearTimeout(cameraTimeout);
+        cameraTimeout = setTimeout(() => {
+          onCameraChange({
+            position: cameraRef.current!.position.toArray() as [
+              number,
+              number,
+              number
+            ],
+            target: controls.target.toArray() as [number, number, number],
+          });
+        }, 100);
+      };
+
+      const handleTransformChange = () => {
+        if (isApplyingUpdateRef.current || !modelRef.current) return;
+        const { position, rotation, scale } = modelRef.current;
+        onTransformChange({
+          position: position.toArray() as [number, number, number],
+          rotation: [
+            rotation.x,
+            rotation.y,
+            rotation.z,
+            rotation.order as EulerOrder,
+          ],
+          scale: scale.toArray() as [number, number, number],
+        });
+      };
+
+      const handleDraggingChanged = (event: THREE.Event) => {
+        controls.enabled = !event.value;
+      };
+
+      controls.addEventListener("change", handleCameraChange);
+      transformControls.addEventListener("objectChange", handleTransformChange);
+      transformControls.addEventListener(
+        "dragging-changed",
+        handleDraggingChanged
+      );
+
+      return () => {
+        controls.removeEventListener("change", handleCameraChange);
+        transformControls.removeEventListener(
+          "objectChange",
+          handleTransformChange
+        );
+        transformControls.removeEventListener(
+          "dragging-changed",
+          handleDraggingChanged
+        );
+      };
+    }, [onCameraChange, onTransformChange]);
 
     return <div ref={mountRef} style={{ width: "100%", height: "100%" }} />;
   }
